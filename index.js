@@ -390,12 +390,8 @@
 
 
 // -----------------------------------------------------this is updated------------------------
-
-
-
-// ==========================
-//       SETUP
-// ==========================
+// index.js (improved backend)
+// Node / CommonJS style (works with existing setups)
 require("dotenv").config();
 const express = require("express");
 const http = require("http");
@@ -411,231 +407,376 @@ const { Server } = require("socket.io");
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+
+// serve uploads (dev). In production use CDN/S3.
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+app.use("/uploads", express.static(UPLOAD_DIR));
 
 const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_THIS_SECRET";
-const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017/messenger";
+const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017/messenger_app";
 
-// ==========================
-//     MONGOOSE MODELS
-// ==========================
-mongoose.connect(MONGO_URI);
+// -----------------------------
+// DB connection helper
+// -----------------------------
+let isConnected = false;
+async function connectDB() {
+  if (isConnected) return;
+  try {
+    await mongoose.connect(MONGO_URI);
+    isConnected = true;
+    console.log("MongoDB connected");
+  } catch (err) {
+    console.error("MongoDB connection error:", err);
+    throw err;
+  }
+}
 
-const userSchema = new mongoose.Schema({
-  name: String,
-  email: { type: String, unique: true },
-  password: String,
-  online: { type: Boolean, default: false },
-  socketId: String,
-});
+// -----------------------------
+// Schemas + safe model creation
+// -----------------------------
+const UserSchema = new mongoose.Schema(
+  {
+    name: String,
+    email: { type: String, unique: true },
+    password: String,
+    online: { type: Boolean, default: false },
+    socketId: { type: String, default: null },
+  },
+  { timestamps: true }
+);
 
-const chatSchema = new mongoose.Schema({
-  type: { type: String, enum: ["private", "group"], default: "private" },
-  name: String,
-  members: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
-  createdAt: { type: Date, default: Date.now },
-});
+const ChatSchema = new mongoose.Schema(
+  {
+    type: { type: String, enum: ["private", "group"], default: "private" },
+    name: String,
+    members: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+  },
+  { timestamps: true }
+);
 
-const messageSchema = new mongoose.Schema({
-  chat: { type: mongoose.Schema.Types.ObjectId, ref: "Chat" },
-  sender: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
-  text: String,
-  image: String,
-  readBy: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
-  createdAt: { type: Date, default: Date.now },
-});
+const MessageSchema = new mongoose.Schema(
+  {
+    chat: { type: mongoose.Schema.Types.ObjectId, ref: "Chat" },
+    sender: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    text: String,
+    image: String,
+    readBy: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+  },
+  { timestamps: true }
+);
 
-const User = mongoose.model("User", userSchema);
-const Chat = mongoose.model("Chat", chatSchema);
-const Message = mongoose.model("Message", messageSchema);
+const User = mongoose.models.User || mongoose.model("User", UserSchema);
+const Chat = mongoose.models.Chat || mongoose.model("Chat", ChatSchema);
+const Message = mongoose.models.Message || mongoose.model("Message", MessageSchema);
 
-// ==========================
-//        IMAGE UPLOAD
-// ==========================
-const uploadDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
-
+// -----------------------------
+// Multer (image upload) - dev / temp storage
+// -----------------------------
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) =>
-    cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "_")),
+    cb(null, `${Date.now()}_${file.originalname.replace(/\s+/g, "_")}`),
 });
 const upload = multer({ storage });
 
-// ==========================
-//     AUTH HELPERS
-// ==========================
+// -----------------------------
+// Helpers
+// -----------------------------
 function generateToken(user) {
-  return jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: "7d" });
+  return jwt.sign({ id: String(user._id), email: user.email }, JWT_SECRET, {
+    expiresIn: "7d",
+  });
 }
 
-async function auth(req, res, next) {
+function isValidObjectId(id) {
+  return mongoose.Types.ObjectId.isValid(String(id));
+}
+
+// Auth middleware (ensures DB connected & user exists)
+async function authMiddleware(req, res, next) {
   try {
-    const header = req.headers.authorization;
+    await connectDB();
+    const header = req.headers["authorization"];
     if (!header) return res.status(401).json({ error: "No token" });
-
     const token = header.split(" ")[1];
-    const decoded = jwt.verify(token, JWT_SECRET);
+    if (!token) return res.status(401).json({ error: "No token" });
 
-    req.user = await User.findById(decoded.id);
-    if (!req.user) return res.status(401).json({ error: "User not found" });
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch (err) {
+      return res.status(401).json({ error: "Invalid token" });
+    }
 
+    if (!decoded?.id || !isValidObjectId(decoded.id)) {
+      return res.status(401).json({ error: "Invalid token payload" });
+    }
+
+    const user = await User.findById(decoded.id);
+    if (!user) return res.status(401).json({ error: "User not found" });
+
+    req.user = user;
     next();
-  } catch {
-    res.status(401).json({ error: "Invalid token" });
+  } catch (err) {
+    console.error("auth error", err);
+    res.status(500).json({ error: "Auth failed" });
   }
 }
 
-// ==========================
-//        AUTH ROUTES
-// ==========================
+// -----------------------------
+// Routes - Auth
+// -----------------------------
 app.post("/signup", async (req, res) => {
-  const { name, email, password } = req.body;
+  try {
+    await connectDB();
+    const { name, email, password } = req.body;
+    if (!name || !email || !password)
+      return res.status(400).json({ error: "Missing fields" });
 
-  const exists = await User.findOne({ email });
-  if (exists) return res.status(400).json({ error: "User already exists" });
+    const exists = await User.findOne({ email });
+    if (exists) return res.status(400).json({ error: "User already exists" });
 
-  const hashed = await bcrypt.hash(password, 10);
-  const user = new User({ name, email, password: hashed });
-  await user.save();
-
-  res.json({ message: "Signup successful" });
+    const hashed = await bcrypt.hash(password, 10);
+    const u = new User({ name, email, password: hashed });
+    await u.save();
+    res.json({ message: "Signup successful", id: u._id });
+  } catch (err) {
+    console.error("signup error", err);
+    // handle duplicate key (unique email) gracefully
+    if (err.code === 11000) return res.status(400).json({ error: "Email already used" });
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post("/signin", async (req, res) => {
-  const { email, password } = req.body;
+  try {
+    await connectDB();
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: "Missing fields" });
 
-  const u = await User.findOne({ email });
-  if (!u) return res.status(400).json({ error: "Invalid email or password" });
+    const u = await User.findOne({ email });
+    if (!u) return res.status(400).json({ error: "Invalid email or password" });
 
-  const ok = await bcrypt.compare(password, u.password);
-  if (!ok) return res.status(400).json({ error: "Invalid email or password" });
+    const match = await bcrypt.compare(password, u.password);
+    if (!match) return res.status(400).json({ error: "Invalid email or password" });
 
-  const token = generateToken(u);
-  res.json({ token });
-});
-
-app.get("/me", auth, (req, res) => {
-  res.json({ id: req.user._id, name: req.user.name, email: req.user.email, online: req.user.online });
-});
-
-// ==========================
-//         CHAT ROUTES
-// ==========================
-app.post("/chats", auth, async (req, res) => {
-  const { type, memberId, name, members } = req.body;
-
-  if (type === "private") {
-    const existing = await Chat.findOne({
-      type: "private",
-      members: { $all: [req.user._id, memberId], $size: 2 },
-    });
-    if (existing) return res.json(existing);
-
-    const chat = await Chat.create({
-      type: "private",
-      members: [req.user._id, memberId],
-    });
-
-    return res.json(chat);
+    const token = generateToken(u);
+    res.json({ token, user: { id: u._id, name: u.name, email: u.email } });
+  } catch (err) {
+    console.error("signin error", err);
+    res.status(500).json({ error: err.message });
   }
-
-  // group
-  const chat = await Chat.create({
-    type: "group",
-    name,
-    members: [req.user._id, ...members],
-  });
-
-  res.json(chat);
 });
 
-app.get("/chats", auth, async (req, res) => {
-  const chats = await Chat.find({ members: req.user._id })
-    .populate("members", "name email online");
-
-  res.json(chats);
+app.get("/me", authMiddleware, (req, res) => {
+  const u = req.user;
+  res.json({ id: u._id, name: u.name, email: u.email, online: u.online });
 });
 
-app.get("/chats/:id/messages", auth, async (req, res) => {
-  const messages = await Message.find({ chat: req.params.id })
-    .sort({ createdAt: 1 })
-    .populate("sender", "name email");
-
-  res.json(messages);
+// -----------------------------
+// Helper endpoints used by frontend
+// -----------------------------
+app.get("/users/by-email", authMiddleware, async (req, res) => {
+  try {
+    await connectDB();
+    const email = req.query.email;
+    if (!email) return res.status(400).json({ error: "email required" });
+    const u = await User.findOne({ email }, "_id name email");
+    if (!u) return res.status(404).json({ error: "Not found" });
+    res.json({ id: u._id, name: u.name, email: u.email });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// ==========================
-//     IMAGE UPLOAD ROUTE
-// ==========================
-app.post("/upload", auth, upload.single("image"), (req, res) => {
-  const url = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
-  res.json({ url });
+app.post("/resolve-emails", authMiddleware, async (req, res) => {
+  try {
+    await connectDB();
+    const { emails } = req.body;
+    if (!Array.isArray(emails)) return res.status(400).json({ error: "emails required" });
+    const users = await User.find({ email: { $in: emails } }, "_id email");
+    res.json({ ids: users.map((u) => u._id) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// ==========================
-//        SOCKET.IO
-// ==========================
+// -----------------------------
+// Chats & Messages routes
+// -----------------------------
+app.post("/chats", authMiddleware, async (req, res) => {
+  try {
+    await connectDB();
+    const { type, memberId, name, members } = req.body;
+
+    if (type === "private") {
+      if (!memberId || !isValidObjectId(memberId))
+        return res.status(400).json({ error: "memberId required & must be valid" });
+
+      // avoid duplicate private chat
+      const existing = await Chat.findOne({
+        type: "private",
+        members: { $all: [req.user._id, memberId], $size: 2 },
+      });
+
+      if (existing) return res.json(existing);
+
+      const chat = await Chat.create({ type: "private", members: [req.user._id, memberId] });
+      return res.json(chat);
+    } else {
+      if (!Array.isArray(members) || members.length < 1)
+        return res.status(400).json({ error: "members required for group" });
+
+      const chat = await Chat.create({ type: "group", name: name || "Group", members: [req.user._id, ...members] });
+      return res.json(chat);
+    }
+  } catch (err) {
+    console.error("create chat error", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/chats", authMiddleware, async (req, res) => {
+  try {
+    await connectDB();
+    const chats = await Chat.find({ members: req.user._id }).populate("members", "name email online");
+    res.json(chats);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// messages for chat with pagination (limit & skip by page)
+app.get("/chats/:chatId/messages", authMiddleware, async (req, res) => {
+  try {
+    await connectDB();
+    const { chatId } = req.params;
+    if (!isValidObjectId(chatId)) return res.status(400).json({ error: "Invalid chatId" });
+
+    const limit = Math.min(200, parseInt(req.query.limit || "50", 10));
+    const page = Math.max(0, parseInt(req.query.page || "0", 10));
+
+    const messages = await Message.find({ chat: chatId })
+      .sort({ createdAt: -1 })
+      .skip(page * limit)
+      .limit(limit)
+      .populate("sender", "name email")
+      .lean();
+
+    // return oldest-first
+    res.json(messages.reverse());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Upload (dev)
+app.post("/upload", authMiddleware, upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No file" });
+    const url = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
+    res.json({ url });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// -----------------------------
+// Start HTTP + Socket.IO
+// -----------------------------
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*" },
+  cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
-// Authenticate socket user
+// socket auth & attach user
 io.use(async (socket, next) => {
   try {
-    const token = socket.handshake.auth.token;
-    const decoded = jwt.verify(token.split(" ")[1] || token, JWT_SECRET);
+    await connectDB();
+    const token = socket.handshake.auth?.token;
+    if (!token) return next(new Error("No token"));
+
+    const raw = (token.split && token.split(" ")[1]) || token;
+    const decoded = jwt.verify(raw, JWT_SECRET);
+    if (!decoded?.id || !isValidObjectId(decoded.id)) return next(new Error("Invalid token payload"));
+
     const user = await User.findById(decoded.id);
+    if (!user) return next(new Error("User not found"));
+
     socket.user = user;
-    next();
-  } catch {
-    next(new Error("Socket Auth Failed"));
+    return next();
+  } catch (err) {
+    console.error("socket auth error", err?.message || err);
+    return next(new Error("Authentication error"));
   }
 });
 
 io.on("connection", async (socket) => {
-  const user = socket.user;
-  console.log(`Connected: ${user.name}`);
+  try {
+    const user = socket.user;
+    // set online
+    await User.findByIdAndUpdate(user._id, { online: true, socketId: socket.id });
+    io.emit("userOnline", { userId: user._id, online: true });
 
-  await User.findByIdAndUpdate(user._id, { online: true, socketId: socket.id });
-  io.emit("userOnline", { userId: user._id, online: true });
+    // join personal room
+    socket.join(String(user._id));
 
-  socket.join(String(user._id));
+    // allow client to join chat rooms
+    socket.on("joinChat", (chatId) => {
+      if (isValidObjectId(chatId)) socket.join(chatId);
+    });
 
-  socket.on("joinChat", (chatId) => socket.join(chatId));
+    // typing indicator
+    socket.on("typing", ({ chatId, isTyping }) => {
+      if (isValidObjectId(chatId)) socket.to(chatId).emit("typing", { chatId, userId: user._id, isTyping });
+    });
 
-  socket.on("typing", ({ chatId, isTyping }) => {
-    socket.to(chatId).emit("typing", { chatId, userId: user._id, isTyping });
-  });
+    // send message: save + emit populated message
+    socket.on("sendMessage", async (data, cb) => {
+      try {
+        const { chatId, text, image } = data;
+        if (!isValidObjectId(chatId)) return cb?.({ ok: false, error: "Invalid chatId" });
 
-  socket.on("sendMessage", async (data, cb) => {
-    try {
-      const msg = await Message.create({
-        chat: data.chatId,
-        sender: user._id,
-        text: data.text || "",
-        image: data.image || null,
-        readBy: [user._id],
-      });
+        const msg = await Message.create({
+          chat: chatId,
+          sender: user._id,
+          text: text || "",
+          image: image || null,
+          readBy: [user._id],
+        });
 
-      const populated = await Message.findById(msg._id).populate("sender", "name email");
+        // populate properly (no execPopulate)
+        const populated = await Message.findById(msg._id).populate("sender", "name email");
+        io.to(chatId).emit("newMessage", populated);
 
-      io.to(data.chatId).emit("newMessage", populated);
+        cb?.({ ok: true, message: populated });
+      } catch (err) {
+        console.error("sendMessage error", err);
+        cb?.({ ok: false, error: err.message });
+      }
+    });
 
-      cb?.({ ok: true });
-    } catch (e) {
-      cb?.({ ok: false, error: e.message });
-    }
-  });
+    // mark read
+    socket.on("markRead", async ({ chatId }) => {
+      if (!isValidObjectId(chatId)) return;
+      await Message.updateMany({ chat: chatId, readBy: { $ne: user._id } }, { $push: { readBy: user._id } });
+      io.to(chatId).emit("messagesRead", { chatId, userId: user._id });
+    });
 
-  socket.on("disconnect", async () => {
-    await User.findByIdAndUpdate(user._id, { online: false, socketId: null });
-    io.emit("userOnline", { userId: user._id, online: false });
-    console.log(`Disconnected: ${user.name}`);
-  });
+    socket.on("disconnect", async () => {
+      await User.findByIdAndUpdate(user._id, { online: false, socketId: null });
+      io.emit("userOnline", { userId: user._id, online: false });
+    });
+  } catch (err) {
+    console.error("socket connection handler error", err);
+  }
 });
 
-// ==========================
+// -----------------------------
+// Start server
+// -----------------------------
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log("Server running on", PORT));
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
