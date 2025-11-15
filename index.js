@@ -621,7 +621,7 @@ io.use(async (socket, next) => {
     socket.user = user;
     next();
   } catch {
-    next(new Error("Auth error"));
+    next(new Error("Auth error h"));
   }
 });
 
