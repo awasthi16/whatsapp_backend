@@ -605,7 +605,7 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
     origin: [
-      "https://whatsapp-frontend-yourname.vercel.app", // ⚠️ CHANGE THIS
+       "https://whatsapp-gamma-sage.vercel.app", // ⚠️ CHANGE THIS
       "http://localhost:3000",
     ],
     methods: ["GET", "POST"],
