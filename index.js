@@ -411,7 +411,7 @@ const app = express();
 app.use(
   cors({
     origin: [
-      "https://whatsapp-frontend-yourname.vercel.app", // ⚠️ CHANGE THIS TO YOUR VERCEL FRONTEND URL
+      "https://whatsapp-gamma-sage.vercel.app", // ⚠️ CHANGE THIS TO YOUR VERCEL FRONTEND URL
       "http://localhost:3000",
     ],
     methods: ["GET", "POST"],
