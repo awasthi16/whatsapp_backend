@@ -113,6 +113,19 @@ const fs = require("fs");
 const { Server } = require("socket.io");
 
 const app = express();
+
+// ----------------- CORS (IMPORTANT FOR RENDER + VERCEL) -----------------
+app.use(
+  cors({
+    origin: [
+      "https://whatsapp-gamma-sage.vercel.app", // ⚠️ CHANGE THIS TO YOUR VERCEL FRONTEND URL
+      "http://localhost:3000",
+    ],
+    methods: ["GET", "POST"],
+    credentials: true,
+  })
+);
+
 app.use(cors());
 app.use(express.json());
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
